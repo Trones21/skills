@@ -30,6 +30,26 @@ org. They chain: generate docs, then describe from those docs.
 **Requirements:** the [`gh` CLI](https://cli.github.com/) (authenticated) and
 `jq`. Editing descriptions needs repo admin scope.
 
+### Personal data
+
+| Skill | What it does | Cadence |
+|-------|--------------|---------|
+| [`inbox-to-dataset`](./inbox-to-dataset) | Turns a labelled email archive into a structured, publishable dataset — scout, fix a schema, paginate the pull durably, group events into entities, anonymise, state the sampling bias. | Heavy once, then incremental |
+
+The extraction is the expensive part and the skill is mostly about not paying
+for it twice: mail connectors are remote, so every message passes through the
+model to be read. A few thousand messages is a long grind; a later refresh is
+one pass.
+
+Bundled scripts are generic — `merge_pages.py` dedupes the per-page extraction
+files and reports coverage, `check_leaks.py` cross-references real names against
+every published free-text field and exits non-zero if any survived
+pseudonymisation.
+
+Worked example: six years of job-search mail →
+[live dashboard](https://thomasrones.com/job-search) ·
+[write-up](https://thomasrones.com/projects/job-search-measured).
+
 ## Layout
 
 Each skill is a self-contained directory with a `SKILL.md` and any bundled
