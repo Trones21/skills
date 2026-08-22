@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+#
+# git-backup — keep a live second copy of every repo on GitLab.com, pushed
+# automatically whenever you push to origin.
+#
+# !! STATUS: NOT YET RUN FOR REAL. The git-side mechanics (hook chaining,
+# !! recursion guards, non-blocking failure, ref coverage) are tested against
+# !! local bare repos. Every GitLab API call, the ssh transport, `install`, and
+# !! `doctor` have never executed once. Do a single-repo first run before
+# !! trusting this as a backup — see SKILL.md, "What is and isn't verified".
+#
+# Complements a periodic snapshot backup (tarball -> S3) rather than replacing
+# it: this one carries full history, every branch and every tag, continuously.
+#
+# How it works
+#   `install` points core.hooksPath at ~/.githooks and drops a pre-push hook
+#   there. On every push to origin the hook calls `hook-run`, which:
+#     - does nothing if the repo opted out (`git config backup.disabled true`)
+#     - warns and creates the GitLab project + `backup` remote if missing
+#     - fires a detached push of all branches and tags to that remote
+#   A mirror failure warns; it never blocks or fails your real push.
+#
+# Requires: git, curl, jq. A GitLab personal access token with the `api` scope
+# (project creation). Pushing uses ssh by default, so no token ends up in any
+# repo's .git/config.
+#
+# Usage:
+#   git-backup <command> [flags]
+#
+# Commands:
+#   install               Install the global hook + scaffold the config file.
+#   doctor                Check config, token, API reachability, ssh auth.
+#   status [ROOT]         Audit every repo under ROOT (default ~/gh): does it
+#                         have a mirror remote, is it opted out, is its hook
+#                         shadowed, how stale is the mirror.
+#   ensure-remote         Create the GitLab project for this repo (if needed)
+#                         and add the `backup` remote. Idempotent.
+#   sync                  Push all branches + tags to the mirror now.
+#   sync-all [ROOT]       ensure-remote + sync across every repo under ROOT.
+#                         This is the backfill for repos you already have.
+#   enable | disable      Opt this repo back in / out of mirroring.
+#   hook-run <remote> <url>   Internal: called by the pre-push hook.
+#   uninstall             Remove the hook and unset core.hooksPath.
+#
+# Flags:
+#   --repo DIR    Operate on the repo at DIR instead of the current directory.
+#   --depth N     How deep under ROOT to look for repos (default 3).
+#   --dry-run     Print what would happen; touch nothing remote.
+#   --quiet       Suppress progress chatter (used by the detached hook push).
+#   --force       Allow non-fast-forward pushes to the mirror. Off by default:
+#                 a backup that can be rewritten by a bad local state is not a
+#                 backup.
+
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(dirname "$SELF")"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/git-backup"
+CONFIG="${GIT_BACKUP_CONFIG:-$CONFIG_DIR/config}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/git-backup"
+LOG="$STATE_DIR/mirror.log"
+HOOK_DIR="${GIT_BACKUP_HOOKDIR:-$HOME/.githooks}"
+
+REPO_DIR=""
+DEPTH=3
+DRY_RUN=0
+QUIET=0
+FORCE=0
+
+# ---------------------------------------------------------------- output ----
+
+c_red=$'\033[31m'; c_yel=$'\033[33m'; c_grn=$'\033[32m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+[[ -t 2 ]] || { c_red=; c_yel=; c_grn=; c_dim=; c_off=; }
+
+say()  { [[ $QUIET -eq 1 ]] || printf '%s\n' "$*" >&2; }
+warn() { printf '%sgit-backup:%s %s\n' "$c_yel" "$c_off" "$*" >&2; }
+die()  { printf '%sgit-backup:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
+ts()   { date +%s; }
+
+# Print the header comment block, however long it grows.
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$SELF"; }
+
+# ---------------------------------------------------------------- config ----
+
+# Parsed rather than sourced: the config is a plain key=value file and should
+# not be able to execute anything just by being read.
+cfg() {
+  local key="$1" default="${2:-}" val=""
+  if [[ -f "$CONFIG" ]]; then
+    val="$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -n1)"
+    val="${val%%#*}"                       # strip trailing comment
+    val="$(printf '%s' "$val" | sed 's/[[:space:]]*$//; s/^"//; s/"$//')"
+  fi
+  printf '%s' "${val:-$default}"
+}
+
+HOST=""; NAMESPACE=""; TRANSPORT=""; VISIBILITY=""; REMOTE=""; PREFIX=""; ORIGIN_FILTER=""
+load_config() {
+  HOST="$(cfg host gitlab.com)"
+  NAMESPACE="$(cfg namespace)"
+  TRANSPORT="$(cfg transport ssh)"
+  VISIBILITY="$(cfg visibility private)"
+  REMOTE="$(cfg remote_name backup)"
+  PREFIX="$(cfg prefix)"
+  ORIGIN_FILTER="$(cfg origin_filter)"
+  [[ "$(cfg force false)" == "true" ]] && FORCE=1
+}
+
+# Mirror-everything is the default. origin_filter is the escape hatch for
+# machines that also hold clones of other people's repos, which you have no
+# reason to back up.
+origin_wanted() {
+  [[ -z "$ORIGIN_FILTER" ]] && return 0
+  local url; url="$(git remote get-url origin 2>/dev/null || true)"
+  [[ -z "$url" ]] && return 0
+  printf '%s' "$url" | grep -Eq "$ORIGIN_FILTER"
+}
+
+# Token, in order of preference. Never written to disk by this script and never
+# embedded in a remote URL when transport=ssh.
+resolve_token() {
+  local t="${GITLAB_TOKEN:-}"
+  if [[ -z "$t" ]]; then
+    local cmd; cmd="$(cfg token_cmd)"
+    [[ -n "$cmd" ]] && t="$(eval "$cmd" 2>/dev/null | head -n1)"
+  fi
+  if [[ -z "$t" ]]; then
+    local f; f="$(cfg token_file)"
+    [[ -n "$f" && -r "${f/#\~/$HOME}" ]] && t="$(head -n1 "${f/#\~/$HOME}")"
+  fi
+  printf '%s' "$t"
+}
+
+# ------------------------------------------------------------- gitlab api ----
+
+API_BODY=""; API_CODE=""
+api() {
+  local method="$1" path="$2" data="${3:-}" token out
+  token="$(resolve_token)"
+  [[ -n "$token" ]] || die "no GitLab token (set GITLAB_TOKEN, or token_cmd/token_file in $CONFIG)"
+  local args=(-sS -X "$method" -H "PRIVATE-TOKEN: $token"
+              -H "Content-Type: application/json" -w $'\n%{http_code}')
+  [[ -n "$data" ]] && args+=(--data "$data")
+  out="$(curl "${args[@]}" "https://$HOST/api/v4/$path" 2>&1)" || { API_CODE=000; API_BODY="$out"; return 1; }
+  API_CODE="${out##*$'\n'}"
+  API_BODY="${out%$'\n'*}"
+  [[ "$API_CODE" =~ ^2 ]]
+}
+
+api_err() { printf '%s' "$API_BODY" | jq -r '.message // .error // .' 2>/dev/null | head -n3; }
+
+urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
+
+# GitLab paths: letters, digits, '_', '-', '.'; must start alphanumeric and must
+# not end in .git or .atom. GitHub names are looser, so normalize.
+slug() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/\.(git|atom)$//; s/[^a-z0-9_.-]+/-/g; s/^[^a-z0-9]+//; s/[._-]+$//'
+}
+
+# ------------------------------------------------------------------ repo ----
+
+in_repo() { git -C "${REPO_DIR:-.}" rev-parse --git-dir >/dev/null 2>&1; }
+g() { git -C "${REPO_DIR:-.}" "$@"; }
+
+repo_toplevel() { g rev-parse --show-toplevel 2>/dev/null; }
+
+# Prefer the name origin knows us by; fall back to the directory name.
+repo_name() {
+  local url name
+  url="$(g remote get-url origin 2>/dev/null || true)"
+  if [[ -n "$url" ]]; then
+    name="${url##*/}"; name="${name%.git}"
+  else
+    name="$(basename "$(repo_toplevel)")"
+  fi
+  printf '%s' "$name"
+}
+
+# ------------------------------------------------------------ operations ----
+
+cmd_install() {
+  command -v git >/dev/null || die "git not found"
+  command -v jq  >/dev/null || die "jq not found"
+  command -v curl >/dev/null || die "curl not found"
+
+  mkdir -p "$HOOK_DIR" "$STATE_DIR" "$CONFIG_DIR"
+
+  local existing; existing="$(git config --global --get core.hooksPath || true)"
+  if [[ -n "$existing" && "$existing" != "$HOOK_DIR" ]]; then
+    warn "core.hooksPath is already set to '$existing'."
+    warn "Refusing to clobber it. Either move your hooks into $HOOK_DIR, or set"
+    warn "GIT_BACKUP_HOOKDIR='$existing' and re-run install to add the hook there."
+    return 1
+  fi
+
+  local src="$SCRIPT_DIR/pre-push" dst="$HOOK_DIR/pre-push"
+  [[ -f "$src" ]] || die "hook source not found at $src"
+  if [[ -e "$dst" ]] && ! cmp -s "$src" "$dst"; then
+    cp "$dst" "$dst.bak.$(ts)"
+    say "existing hook backed up to $dst.bak.*"
+  fi
+  install -m 0755 "$src" "$dst"
+  git config --global core.hooksPath "$HOOK_DIR"
+
+  if [[ ! -f "$CONFIG" ]]; then
+    cat >"$CONFIG" <<'EOF'
+# git-backup — secondary (mirror) remote config.
+# Plain key=value. This file is parsed, never executed.
+
+provider    = gitlab
+host        = gitlab.com
+
+# Namespace to create mirrors under. Blank = your personal namespace.
+# A group (e.g. "mymirrors") keeps them out of your main project list.
+namespace   =
+
+# Prefix added to every mirror project name, e.g. "gh-" -> gh-myrepo.
+prefix      =
+
+# ssh keeps tokens out of every repo's .git/config. Use https only if you
+# have a credential helper configured for the host.
+transport   = ssh
+
+visibility  = private
+remote_name = backup
+
+# Blank mirrors EVERY repo you push from (opt out per-repo with
+# `git-backup disable`). Set an extended-regex matched against origin's URL to
+# limit it, e.g.  origin_filter = github\.com[:/]myuser/
+origin_filter =
+
+# Allow non-fast-forward pushes to the mirror. Leave false: a backup that a
+# bad local state can rewrite is not a backup.
+force       = false
+
+# Token with the `api` scope, needed only to CREATE projects.
+# Order: $GITLAB_TOKEN, then token_cmd, then token_file.
+token_cmd   =
+token_file  =
+EOF
+    chmod 600 "$CONFIG"
+    say "wrote config template to $CONFIG"
+  fi
+
+  printf '%sinstalled.%s hook: %s  config: %s\n' "$c_grn" "$c_off" "$dst" "$CONFIG" >&2
+  say ""
+  say "Next: put a GitLab token with the 'api' scope where the config can find it,"
+  say "then run:  git-backup doctor"
+  say ""
+  warn "this tool has never completed a real run against gitlab.com."
+  warn "Verify on ONE small repo (ensure-remote --dry-run, then for real, then"
+  warn "sync) and confirm the project is private with all refs, before sync-all."
+}
+
+cmd_uninstall() {
+  local cur; cur="$(git config --global --get core.hooksPath || true)"
+  [[ "$cur" == "$HOOK_DIR" ]] && git config --global --unset core.hooksPath
+  rm -f "$HOOK_DIR/pre-push"
+  say "hook removed; core.hooksPath unset. Per-repo 'backup' remotes were left alone."
+}
+
+cmd_doctor() {
+  load_config
+  local ok=0
+  local hp; hp="$(git config --global --get core.hooksPath || true)"
+  if [[ "$hp" == "$HOOK_DIR" && -x "$HOOK_DIR/pre-push" ]]; then
+    printf '  %s✓%s hook installed at %s\n' "$c_grn" "$c_off" "$HOOK_DIR/pre-push"
+  else
+    printf '  %s✗%s hook not installed (core.hooksPath=%s) — run: git-backup install\n' "$c_red" "$c_off" "${hp:-unset}"; ok=1
+  fi
+
+  if [[ -f "$CONFIG" ]]; then
+    printf '  %s✓%s config %s (host=%s namespace=%s transport=%s)\n' \
+      "$c_grn" "$c_off" "$CONFIG" "$HOST" "${NAMESPACE:-<personal>}" "$TRANSPORT"
+  else
+    printf '  %s✗%s no config at %s\n' "$c_red" "$c_off" "$CONFIG"; ok=1
+  fi
+
+  if [[ -n "$(resolve_token)" ]]; then
+    if api GET user; then
+      printf '  %s✓%s token valid — authenticated as %s\n' "$c_grn" "$c_off" "$(printf '%s' "$API_BODY" | jq -r .username)"
+    else
+      printf '  %s✗%s token rejected by %s (HTTP %s): %s\n' "$c_red" "$c_off" "$HOST" "$API_CODE" "$(api_err)"; ok=1
+    fi
+  else
+    printf '  %s✗%s no token resolvable (GITLAB_TOKEN / token_cmd / token_file)\n' "$c_red" "$c_off"; ok=1
+  fi
+
+  if [[ "$TRANSPORT" == "ssh" ]]; then
+    local out; out="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T "git@$HOST" 2>&1)"
+    if printf '%s' "$out" | grep -qi 'welcome\|successfully authenticated'; then
+      printf '  %s✓%s ssh auth to git@%s works\n' "$c_grn" "$c_off" "$HOST"
+    else
+      printf '  %s✗%s ssh auth to git@%s failed — add your key at https://%s/-/user_settings/ssh_keys\n' \
+        "$c_red" "$c_off" "$HOST" "$HOST"
+      printf '      %s%s%s\n' "$c_dim" "$(printf '%s' "$out" | head -n1)" "$c_off"; ok=1
+    fi
+  fi
+  return $ok
+}
+
+# Resolve the numeric namespace id once, so project creation lands in the right
+# place whether `namespace` names a group or a user.
+namespace_id() {
+  [[ -z "$NAMESPACE" ]] && { printf ''; return 0; }
+  api GET "namespaces?search=$(urlenc "$NAMESPACE")" || return 1
+  printf '%s' "$API_BODY" | jq -r --arg n "$NAMESPACE" \
+    'map(select(.full_path == $n or .path == $n)) | .[0].id // empty'
+}
+
+cmd_ensure_remote() {
+  load_config
+  in_repo || die "not a git repository: ${REPO_DIR:-$PWD}"
+
+  if g remote get-url "$REMOTE" >/dev/null 2>&1; then
+    say "'$REMOTE' remote already present: $(g remote get-url "$REMOTE")"
+    return 0
+  fi
+
+  local name path ns full
+  name="$(repo_name)"
+  path="$(slug "${PREFIX}${name}")"
+  [[ -n "$path" ]] || die "could not derive a valid GitLab path from '$name'"
+
+  ns="$NAMESPACE"
+  if [[ -z "$ns" ]]; then
+    api GET user || die "cannot reach $HOST: $(api_err)"
+    ns="$(printf '%s' "$API_BODY" | jq -r .username)"
+  fi
+  full="$ns/$path"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    say "[dry-run] would ensure https://$HOST/$full and add remote '$REMOTE'"
+    return 0
+  fi
+
+  if api GET "projects/$(urlenc "$full")"; then
+    say "project exists: $full"
+  else
+    local nsid body; nsid="$(namespace_id || true)"
+    body="$(jq -nc --arg n "$path" --arg p "$path" --arg v "$VISIBILITY" \
+              --arg d "Mirror of $(g remote get-url origin 2>/dev/null || echo "$name")" \
+              --arg i "${nsid:-}" \
+              '{name:$n, path:$p, visibility:$v, description:$d}
+               + (if $i == "" then {} else {namespace_id: ($i|tonumber)} end)')"
+    api POST projects "$body" || die "could not create $full (HTTP $API_CODE): $(api_err)"
+    say "created project: $full"
+  fi
+
+  local url
+  if [[ "$TRANSPORT" == "ssh" ]]; then
+    url="git@$HOST:$full.git"
+  else
+    url="https://$HOST/$full.git"
+  fi
+  g remote add "$REMOTE" "$url"
+  g config backup.project "$full"
+  printf '%s✓%s added remote %s -> %s\n' "$c_grn" "$c_off" "$REMOTE" "$url" >&2
+}
+
+cmd_sync() {
+  load_config
+  in_repo || die "not a git repository: ${REPO_DIR:-$PWD}"
+
+  g remote get-url "$REMOTE" >/dev/null 2>&1 || { warn "no '$REMOTE' remote in $(repo_toplevel) — run: git-backup ensure-remote"; return 1; }
+
+  local push=(push --quiet --no-verify)
+  [[ $FORCE -eq 1 ]] && push+=(--force)
+  [[ $DRY_RUN -eq 1 ]] && push+=(--dry-run)
+
+  # --all and --tags are mutually exclusive in git, so this is two pushes.
+  local rc=0
+  g "${push[@]}" "$REMOTE" --all  || rc=$?
+  g "${push[@]}" "$REMOTE" --tags || rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    [[ $DRY_RUN -eq 1 ]] || g config backup.lastsync "$(ts)"
+    say "mirrored $(repo_toplevel) -> $REMOTE"
+  else
+    warn "mirror push failed for $(repo_toplevel) (exit $rc); see $LOG"
+  fi
+  return $rc
+}
+
+# Walk ROOT for work trees. -prune keeps us out of .git internals and vendored
+# checkouts under node_modules et al.
+find_repos() {
+  local root="${1:-$HOME/gh}"
+  find "$root" -maxdepth "$DEPTH" \
+       \( -name node_modules -o -name .venv -o -name vendor \) -prune -o \
+       -type d -name .git -print 2>/dev/null \
+    | sed 's#/\.git$##' | sort
+}
+
+cmd_sync_all() {
+  load_config
+  local root="${1:-$HOME/gh}" n=0 fail=0
+  while IFS= read -r r; do
+    [[ -n "$r" ]] || continue
+    REPO_DIR="$r"
+    [[ "$(g config --bool --get backup.disabled 2>/dev/null)" == "true" ]] && { say "skip (disabled): $r"; continue; }
+    ( cd "$r" && origin_wanted ) || { say "skip (origin_filter): $r"; continue; }
+    say "── $r"
+    cmd_ensure_remote && cmd_sync || fail=$((fail+1))
+    n=$((n+1))
+  done < <(find_repos "$root")
+  printf '\n%d repo(s) processed, %d failed\n' "$n" "$fail" >&2
+  [[ $fail -eq 0 ]]
+}
+
+cmd_status() {
+  load_config
+  local root="${1:-$HOME/gh}" now; now="$(ts)"
+  printf '%-32s %-10s %-9s %s\n' REPO MIRROR AGE NOTES
+  printf '%-32s %-10s %-9s %s\n' "$(printf '%.32s' '--------------------------------')" ---------- --------- -----
+  while IFS= read -r r; do
+    [[ -n "$r" ]] || continue
+    REPO_DIR="$r"
+    local short mirror age notes; notes=""
+    short="${r#$root/}"
+
+    if [[ "$(g config --bool --get backup.disabled 2>/dev/null)" == "true" ]]; then
+      mirror="off"; age="-"; notes="opted out"
+    elif g remote get-url "$REMOTE" >/dev/null 2>&1; then
+      mirror="yes"
+      local last; last="$(g config --get backup.lastsync 2>/dev/null || echo 0)"
+      if [[ "$last" -gt 0 ]]; then age="$(( (now - last) / 86400 ))d"; else age="never"; notes="remote added, never pushed"; fi
+    else
+      mirror="MISSING"; age="-"; notes="no backup remote"
+    fi
+
+    # A repo-local core.hooksPath (husky sets one) silently overrides the global
+    # one, so this repo never auto-mirrors even though everything else looks fine.
+    # Only a value that differs from ours is a real shadow.
+    local hp; hp="$(g config --local --get core.hooksPath 2>/dev/null || true)"
+    [[ -n "$hp" && "$hp" != "$HOOK_DIR" ]] && \
+      notes="${notes:+$notes; }hook SHADOWED by local core.hooksPath=$hp"
+
+    printf '%-32s %-10s %-9s %s\n' "$short" "$mirror" "$age" "$notes"
+  done < <(find_repos "$root")
+}
+
+cmd_hook_run() {
+  local remote_name="${1:-}" remote_url="${2:-}"
+  [[ -f "$CONFIG" ]] || return 0
+  load_config
+  mkdir -p "$STATE_DIR"
+
+  [[ "$(git config --bool --get backup.disabled 2>/dev/null)" == "true" ]] && return 0
+
+  # Don't recurse when the push being made IS the mirror push.
+  [[ "$remote_name" == "$REMOTE" ]] && return 0
+  [[ -n "$remote_url" && "$remote_url" == *"$HOST"* ]] && return 0
+
+  origin_wanted || return 0
+
+  if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
+    # Cooldown so a persistent failure (token expired, host down) warns once an
+    # hour instead of on every single push.
+    local now last; now="$(ts)"; last="$(git config --get backup.lastattempt 2>/dev/null || echo 0)"
+    if (( now - last < 3600 )); then
+      warn "still no '$REMOTE' remote here (retry suppressed; run: git-backup ensure-remote)"
+      return 0
+    fi
+    git config backup.lastattempt "$now"
+    warn "this repo has no '$REMOTE' remote — creating one on $HOST…"
+    "$SELF" ensure-remote >>"$LOG" 2>&1 || {
+      warn "could not create the mirror remote; see $LOG. Your push is unaffected."
+      return 0
+    }
+    warn "mirror remote created: $(git remote get-url "$REMOTE")"
+  fi
+
+  # Detached so a slow or unreachable mirror never holds up the terminal.
+  local top; top="$(git rev-parse --show-toplevel)"
+  { printf '\n=== %s %s\n' "$(date -Is)" "$top" >>"$LOG"; } 2>/dev/null
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$SELF" sync --quiet --repo "$top" >>"$LOG" 2>&1 </dev/null &
+  else
+    "$SELF" sync --quiet --repo "$top" >>"$LOG" 2>&1 </dev/null &
+  fi
+  disown 2>/dev/null || true
+  return 0
+}
+
+# ------------------------------------------------------------------ main ----
+
+CMD="${1:-}"; shift || true
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)    REPO_DIR="$2"; shift 2 ;;
+    --depth)   DEPTH="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --quiet)   QUIET=1; shift ;;
+    --force)   FORCE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+case "$CMD" in
+  install)       cmd_install ;;
+  uninstall)     cmd_uninstall ;;
+  doctor)        cmd_doctor ;;
+  status)        cmd_status "${ARGS[@]:-}" ;;
+  ensure-remote) cmd_ensure_remote ;;
+  sync)          cmd_sync ;;
+  sync-all)      cmd_sync_all "${ARGS[@]:-}" ;;
+  enable)        git config --unset backup.disabled 2>/dev/null; echo "mirroring enabled here" ;;
+  disable)       git config backup.disabled true; echo "mirroring disabled for this repo" ;;
+  hook-run)      cmd_hook_run "${ARGS[@]:-}" ;;
+  ""|-h|--help)  usage ;;
+  *)             die "unknown command: $CMD (try --help)" ;;
+esac

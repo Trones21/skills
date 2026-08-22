@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# pre-push — global git hook installed at ~/.githooks/pre-push by
+# `git-backup install`. Deliberately tiny: it chains to any repo-local pre-push
+# hook, then hands off to `git-backup hook-run` for the mirroring work.
+#
+# Keeping the logic in git-backup (rather than here) means upgrading the tool
+# never requires rewriting an installed hook.
+#
+# Two non-obvious things this file exists to get right:
+#
+#   1. `git rev-parse --git-path hooks/pre-push` RESPECTS core.hooksPath, so it
+#      returns *this* file once a global hooksPath is set — chaining through it
+#      would recurse forever. We build the repo-local path from
+#      --absolute-git-dir instead, and additionally refuse to exec ourselves
+#      (`-ef` compares inodes, so it also catches symlinks).
+#
+#   2. stdin is the ref list, and it can only be read once. We slurp it up front
+#      and re-feed it to the chained hook.
+#
+# The mirror step can never fail a push: it is invoked with `|| true` and this
+# script always exits 0 unless the *local* hook objected.
+
+set -uo pipefail
+
+REFS="$(cat)"
+
+git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+if [[ -n "$git_dir" ]]; then
+  local_hook="$git_dir/hooks/pre-push"
+  if [[ -x "$local_hook" && ! "$local_hook" -ef "${BASH_SOURCE[0]}" ]]; then
+    { [[ -n "$REFS" ]] && printf '%s\n' "$REFS"; } | "$local_hook" "$@" || exit $?
+  fi
+fi
+
+if command -v git-backup >/dev/null 2>&1; then
+  git-backup hook-run "$@" </dev/null || true
+fi
+
+exit 0

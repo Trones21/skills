@@ -30,6 +30,31 @@ org. They chain: generate docs, then describe from those docs.
 **Requirements:** the [`gh` CLI](https://cli.github.com/) (authenticated) and
 `jq`. Editing descriptions needs repo admin scope.
 
+### Backup
+
+| Skill | What it does | Cadence |
+|-------|--------------|---------|
+| [`mirror-remotes`](./mirror-remotes) ⚠️ | Installs a global `pre-push` hook that auto-creates a GitLab.com mirror for any repo lacking one and pushes all branches + tags there on every push to origin. Plus a `status` audit of which repos are unmirrored, stale, or have a shadowed hook. | Install once, audit occasionally |
+
+⚠️ **Not yet run for real.** The git-side mechanics are tested against local bare
+repos; nothing has ever talked to gitlab.com and `install` has never run on a
+real machine. Don't count it as a backup until a first run is done — see
+[What is and isn't verified](./mirror-remotes/SKILL.md#what-is-and-isnt-verified).
+
+Pairs with a periodic snapshot backup rather than replacing it. A tarball of the
+default branch loses history, other branches, and tags, and is only as fresh as
+its last run; a live mirror carries all of it continuously but shares no fate
+with the snapshot's storage. Two failure domains, two different loss profiles.
+
+Design constraints worth not re-discovering: `git push --all --tags` is rejected
+by git (it takes two pushes), and `git rev-parse --git-path hooks/pre-push`
+honors `core.hooksPath` — so the obvious way to chain a global hook to a
+repo-local one makes it call itself forever. A mirror failure only ever warns;
+it never fails your real push.
+
+**Requirements:** `git`, `curl`, `jq`, a GitLab token with the `api` scope, and
+an ssh key on GitLab for the default transport.
+
 ### Personal data
 
 | Skill | What it does | Cadence |
