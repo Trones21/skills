@@ -1,0 +1,20 @@
+# Run artifacts from the skills in this repo.
+#
+# This repo holds skill *source*. Anything a skill produces when you actually
+# run it is transient output for that run — it belongs to the working directory
+# you ran it in, not to the skill definition.
+#
+# Skills whose artifacts land outside a repo need nothing here:
+#   repo-docs        clones to a scratch dir ($TMPDIR/repo-docs/<name>)
+#   mirror-remotes   state and logs in ~/.config/ and ~/.local/state/git-backup/
+
+# repo-descriptions — the plan-phase review file, regenerated every run
+descriptions-review.json
+
+# inbox-to-dataset — the extraction. `raw/` and the de-anonymised build must
+# never be committed; see Phase 5 of that skill. `public.json` is meant to be
+# published, but as part of a write-up, not from this repo.
+raw/
+all.jsonl
+private.json
+public.json
